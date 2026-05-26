@@ -124,6 +124,7 @@ class LLMClient:
         settings_obj: Any | None = None,
         *,
         anthropic_api_key: str | None = None,
+        gemini_api_key: str | None = None,
         ollama_base_url: str | None = None,
         ollama_model: str | None = None,
         llm_model: str | None = None,
@@ -137,6 +138,9 @@ class LLMClient:
             anthropic_api_key=anthropic_api_key
             if anthropic_api_key is not None
             else getattr(base, "anthropic_api_key", "") or "",
+            gemini_api_key=gemini_api_key
+            if gemini_api_key is not None
+            else getattr(base, "gemini_api_key", "") or "",
             ollama_base_url=ollama_base_url
             if ollama_base_url is not None
             else getattr(base, "ollama_base_url", "") or "",
@@ -149,13 +153,15 @@ class LLMClient:
     def from_env(cls) -> LLMClient:
         """Build a client from the standard env vars.
 
-        Reads ``ANTHROPIC_API_KEY``, ``LLM_PROVIDER`` (default ``anthropic``),
-        ``OLLAMA_BASE_URL``, ``OLLAMA_MODEL``, ``LLM_MODEL``. Does NOT validate
-        — call :func:`llm_kit.validate_llm_config` against ``client._settings``
-        at app startup to fail fast on missing config.
+        Reads ``ANTHROPIC_API_KEY``, ``GEMINI_API_KEY``, ``LLM_PROVIDER``
+        (default ``anthropic``), ``OLLAMA_BASE_URL``, ``OLLAMA_MODEL``,
+        ``LLM_MODEL``. Does NOT validate — call
+        :func:`llm_kit.validate_llm_config` against ``client._settings`` at
+        app startup to fail fast on missing config.
         """
         return cls(
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+            gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
             ollama_base_url=os.environ.get("OLLAMA_BASE_URL", ""),
             ollama_model=os.environ.get("OLLAMA_MODEL", ""),
             llm_model=os.environ.get("LLM_MODEL", ""),
@@ -163,16 +169,24 @@ class LLMClient:
         )
 
     def _ensure_configured(self) -> None:
-        """One-time provider-specific setup. LiteLLM picks up ``ANTHROPIC_API_KEY``
+        """One-time provider-specific setup. LiteLLM picks up provider keys
         from the environment, but we forward the configured value so a key
-        loaded from .env via the consumer's settings works without exporting it
-        explicitly."""
+        loaded from .env via the consumer's settings works without exporting
+        it explicitly."""
         if self._configured:
             return
         if self._settings.llm_provider == "anthropic":
             key = self._settings.anthropic_api_key or ""
             if key:
                 litellm.anthropic_key = key
+        elif self._settings.llm_provider == "gemini":
+            key = self._settings.gemini_api_key or ""
+            if key:
+                # LiteLLM reads `gemini_api_key` for the `gemini/…` route, but
+                # also accepts the canonical env var. Set both — env wins
+                # over module attr in some LiteLLM versions.
+                litellm.gemini_key = key
+                os.environ.setdefault("GEMINI_API_KEY", key)
         self._configured = True
 
     def _record_usage(self, *, caller: str, model: str, usage: LLMUsage) -> None:
@@ -221,6 +235,7 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         provider: str | None = None,
         json_schema: dict[str, Any] | None = None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """Run a chat-style completion against the configured provider.
 
@@ -255,7 +270,7 @@ class LLMClient:
             raw provider response.
         """
         active_provider = provider or self._settings.llm_provider
-        if active_provider not in {"anthropic", "ollama"}:
+        if active_provider not in {"anthropic", "ollama", "gemini"}:
             # Whitelist is enforced at boot via validate_llm_config; this is
             # a defense-in-depth guard for tests that bypass that path.
             validate_llm_config(self._settings)
@@ -270,7 +285,21 @@ class LLMClient:
                 max_tokens=max_tokens,
                 model=resolved_model,
                 max_retries=max_retries,
+                # Ollama: prefer caller-provided schema; if just json_mode and no
+                # schema, fall back to format="json" (handled inside the method).
                 json_schema=json_schema,
+                json_mode=json_mode,
+            )
+
+        if active_provider == "gemini":
+            return await self._gemini_complete(
+                caller=caller,
+                messages=messages,
+                system=system,
+                max_tokens=max_tokens,
+                model=resolved_model,
+                max_retries=max_retries,
+                json_mode=json_mode,
             )
 
         return await self._anthropic_complete(
@@ -282,7 +311,87 @@ class LLMClient:
             model=resolved_model,
             max_retries=max_retries,
             tools=tools,
+            json_mode=json_mode,
         )
+
+    async def _gemini_complete(
+        self,
+        *,
+        caller: str,
+        messages: list[dict[str, Any]],
+        system: list[dict[str, Any]] | str | None,
+        max_tokens: int,
+        model: str,
+        max_retries: int,
+        json_mode: bool = False,
+    ) -> LLMResponse:
+        """Gemini route via LiteLLM's ``gemini/<model>`` provider.
+
+        Notes specific to Gemini (vs Anthropic):
+
+        - System instruction goes **inside** the ``messages`` list as a
+          ``{"role": "system", ...}`` turn. LiteLLM forwards it as
+          ``systemInstruction`` to the Google API. Passing it as a top-
+          level ``system=`` kwarg (like Anthropic) silently drops it,
+          leaving the model with no instructions.
+        - Gemini does NOT support Anthropic-style prefill (continuing
+          from a partial assistant turn). If the caller appended an
+          assistant turn for prefill purposes, drop it and rely on
+          ``json_mode`` instead.
+        - ``json_mode=True`` → ``response_format={"type":"json_object"}``
+          (mapped to Gemini's ``responseMimeType: application/json`` by
+          LiteLLM). This is the supported way to force JSON output.
+        - Cache flags from the friendly system shape are dropped —
+          Gemini's context caching has a different API.
+        """
+        self._ensure_configured()
+
+        # Flatten the system blocks into a single string.
+        system_text = self._to_ollama_system(system)
+
+        # Strip any trailing assistant turn (Anthropic-style prefill) since
+        # Gemini won't continue from it. The intent (force JSON) flows
+        # through ``json_mode`` instead.
+        gemini_messages: list[dict[str, Any]] = []
+        if system_text:
+            gemini_messages.append({"role": "system", "content": system_text})
+        cleaned_user_messages = list(messages)
+        while cleaned_user_messages and cleaned_user_messages[-1].get("role") == "assistant":
+            cleaned_user_messages.pop()
+        gemini_messages.extend(cleaned_user_messages)
+
+        kwargs: dict[str, Any] = {
+            "model": f"gemini/{model}",
+            "max_tokens": max_tokens,
+            "messages": gemini_messages,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = await litellm.acompletion(**kwargs)
+                break
+            except Exception as exc:
+                if not _is_transient(exc) or attempt >= max_retries:
+                    if isinstance(exc, litellm_exceptions.RateLimitError):
+                        raise LLMRateLimitError(str(exc)) from exc
+                    raise
+                wait = _parse_retry_after(exc)
+                logger.info(
+                    "%s: transient gemini error (%s), sleeping %.1fs before retry (%d/%d)",
+                    caller,
+                    type(exc).__name__,
+                    wait,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(wait)
+
+        text = self._extract_text(response).strip()
+        usage = self._extract_usage(response)
+        self._record_usage(caller=caller, model=model, usage=usage)
+        return LLMResponse(text=text, model=model, usage=usage, raw=response)
 
     async def _anthropic_complete(
         self,
@@ -295,14 +404,24 @@ class LLMClient:
         model: str,
         max_retries: int,
         tools: list[dict[str, Any]] | None = None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         self._ensure_configured()
 
         anthropic_system = self._to_anthropic_system(system)
+        # Anthropic-specific json forcing: prefill the assistant turn with "{"
+        # so the model can only continue with valid JSON characters. We strip
+        # any existing trailing assistant turn first to avoid double-prefill.
+        effective_messages = list(messages)
+        if json_mode:
+            while effective_messages and effective_messages[-1].get("role") == "assistant":
+                effective_messages.pop()
+            effective_messages.append({"role": "assistant", "content": "{"})
+
         kwargs: dict[str, Any] = {
             "model": f"anthropic/{model}",
             "max_tokens": max_tokens,
-            "messages": messages,
+            "messages": effective_messages,
         }
         if anthropic_system is not None:
             kwargs["system"] = anthropic_system
@@ -337,6 +456,11 @@ class LLMClient:
                 await asyncio.sleep(wait)
 
         text = self._extract_text(response).strip()
+        # When json_mode pre-filled "{", the model response *continues* from
+        # there; prepend the brace back so callers receive a complete JSON
+        # object in resp.text.
+        if json_mode:
+            text = "{" + text
         usage = self._extract_usage(response)
         self._record_usage(caller=caller, model=model, usage=usage)
         return LLMResponse(text=text, model=model, usage=usage, raw=response)
@@ -351,6 +475,7 @@ class LLMClient:
         model: str,
         max_retries: int,
         json_schema: dict[str, Any] | None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """Talk to a local Ollama server via the native ``/api/chat`` endpoint.
 

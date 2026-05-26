@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from llm_kit.exceptions import LLMConfigError
 
-SUPPORTED_PROVIDERS = ("anthropic", "ollama")
+SUPPORTED_PROVIDERS = ("anthropic", "ollama", "gemini")
 
 
 def resolve_model(settings_obj, provider: str | None = None) -> str:
@@ -26,6 +26,8 @@ def resolve_model(settings_obj, provider: str | None = None) -> str:
     active = provider or getattr(settings_obj, "llm_provider", "anthropic")
     if active == "ollama":
         return getattr(settings_obj, "ollama_model", "") or ""
+    # Anthropic and Gemini both read from llm_model; the provider prefix
+    # (anthropic/… or gemini/…) is added inside the per-provider call path.
     return getattr(settings_obj, "llm_model", "") or ""
 
 
@@ -49,10 +51,12 @@ def validate_llm_config(settings_obj) -> None:
         )
     if provider == "anthropic" and not getattr(settings_obj, "anthropic_api_key", ""):
         raise LLMConfigError("LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY to be set.")
+    if provider == "gemini" and not getattr(settings_obj, "gemini_api_key", ""):
+        raise LLMConfigError("LLM_PROVIDER=gemini requires GEMINI_API_KEY to be set.")
     if provider == "ollama":
         if not getattr(settings_obj, "ollama_base_url", ""):
             raise LLMConfigError("LLM_PROVIDER=ollama requires OLLAMA_BASE_URL to be set.")
         if not getattr(settings_obj, "ollama_model", ""):
             raise LLMConfigError("LLM_PROVIDER=ollama requires OLLAMA_MODEL to be set.")
     if not resolve_model(settings_obj):
-        raise LLMConfigError("LLM_MODEL is empty: set it in your environment (e.g. claude-sonnet-4-5).")
+        raise LLMConfigError("LLM_MODEL is empty: set it in your environment (e.g. gemini-2.5-flash).")
