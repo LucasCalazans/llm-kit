@@ -236,6 +236,7 @@ class LLMClient:
         provider: str | None = None,
         json_schema: dict[str, Any] | None = None,
         json_mode: bool = False,
+        think: bool = False,
     ) -> LLMResponse:
         """Run a chat-style completion against the configured provider.
 
@@ -289,6 +290,7 @@ class LLMClient:
                 # schema, fall back to format="json" (handled inside the method).
                 json_schema=json_schema,
                 json_mode=json_mode,
+                think=think,
             )
 
         if active_provider == "gemini":
@@ -476,6 +478,7 @@ class LLMClient:
         max_retries: int,
         json_schema: dict[str, Any] | None,
         json_mode: bool = False,
+        think: bool = False,
     ) -> LLMResponse:
         """Talk to a local Ollama server via the native ``/api/chat`` endpoint.
 
@@ -504,6 +507,11 @@ class LLMClient:
             "model": model,
             "messages": ollama_messages,
             "stream": False,
+            # Thinking models (qwen3, deepseek-r1) put their answer in the
+            # `thinking` field and leave `content` empty unless thinking is
+            # disabled. We read `message.content`, so default think=False keeps
+            # callers getting the answer; pass think=True to opt back in.
+            "think": think,
             "options": {"num_predict": max_tokens},
         }
         payload["format"] = json_schema if json_schema is not None else "json"
