@@ -54,6 +54,15 @@ _DEFAULT_WAIT_S = 10.0
 _MAX_WAIT_S = 60.0
 _MAX_RETRIES = 3
 
+# Read timeout for the local Ollama endpoint. A 30B MoE on CPU cold-loads
+# several GB on every call when ``OLLAMA_KEEP_ALIVE=0`` and then does prefill +
+# generation on the CPU — 120s is far too tight and surfaces as ReadTimeout.
+# Generous default (15 min) to cover cold-load + a large-prompt bilingual
+# generation under memory pressure + a payoff retry; override with
+# ``OLLAMA_REQUEST_TIMEOUT_SECONDS``. Only affects the Ollama path; the
+# Anthropic/Gemini paths use LiteLLM's own timeouts.
+_OLLAMA_READ_TIMEOUT_S = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT_SECONDS", "900"))
+
 
 class LLMUsage(BaseModel):
     input_tokens: int = 0
@@ -518,7 +527,7 @@ class LLMClient:
 
         url = f"{base_url}/api/chat"
         last_exc: Exception | None = None
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_OLLAMA_READ_TIMEOUT_S, connect=10.0)) as client:
             for attempt in range(max_retries + 1):
                 try:
                     response = await client.post(url, json=payload)
