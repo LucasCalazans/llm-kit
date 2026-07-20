@@ -28,16 +28,40 @@ _PRICING_USD_PER_MTOK: dict[str, tuple[float, float, float, float]] = {
 # Web search costs $10 per 1000 searches (April 2026 snapshot).
 _WEB_SEARCH_USD_PER_CALL = 10.0 / 1000.0
 
+# Open-weight model families that run locally (Ollama) — zero API cost. Ollama's
+# ``family:tag`` naming (colon) is the reliable discriminator: no cloud model id
+# in the pricing table uses a colon. The family list is a defensive fallback for
+# untagged local names.
+_LOCAL_MODEL_PREFIXES = ("qwen", "llama", "gemma", "mistral", "mixtral", "deepseek", "phi")
+
+
+def is_local_model(model: str) -> bool:
+    """True for models that run on the user's own hardware (Ollama) → cost $0.
+
+    Without this, unknown models fall through to the ``default`` (Sonnet) rate,
+    so local generations would be logged as if they cost money — hiding the
+    whole point of routing to a local model.
+    """
+    if not model:
+        return False
+    if ":" in model:  # Ollama ``name:tag``; cloud model ids never use a colon
+        return True
+    lowered = model.lower()
+    return any(lowered.startswith(prefix) for prefix in _LOCAL_MODEL_PREFIXES)
+
 
 def pricing_per_mtok(model: str) -> tuple[float, float, float, float]:
     """Return (input, output, cache_read, cache_write) USD per 1M tokens.
 
-    Falls back to the ``default`` row when ``model`` is unknown or empty.
-    Matches by prefix so dated variants (``claude-haiku-4-5-20251001``)
-    still resolve to the family rate.
+    Local (Ollama) models return all-zero rates — they run for free. Otherwise
+    falls back to the ``default`` row when ``model`` is unknown or empty, and
+    matches by prefix so dated variants (``claude-haiku-4-5-20251001``) still
+    resolve to the family rate.
     """
     if not model:
         return _PRICING_USD_PER_MTOK["default"]
+    if is_local_model(model):
+        return (0.0, 0.0, 0.0, 0.0)
     for key, rates in _PRICING_USD_PER_MTOK.items():
         if key != "default" and model.startswith(key):
             return rates
@@ -138,4 +162,4 @@ def summarize_costs(by_model: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-__all__ = ["compute_call_cost_usd", "pricing_per_mtok", "summarize_costs"]
+__all__ = ["compute_call_cost_usd", "is_local_model", "pricing_per_mtok", "summarize_costs"]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from llm_kit.pricing import compute_call_cost_usd, pricing_per_mtok, summarize_costs
+from llm_kit.pricing import compute_call_cost_usd, is_local_model, pricing_per_mtok, summarize_costs
 
 
 def test_pricing_per_mtok_resolves_known_family():
@@ -23,6 +23,28 @@ def test_pricing_per_mtok_falls_back_to_default_when_unknown():
 
 def test_pricing_per_mtok_empty_model_falls_back():
     assert pricing_per_mtok("") == pricing_per_mtok("default")
+
+
+def test_pricing_per_mtok_local_ollama_model_is_free():
+    # Local models run on the user's hardware — no API cost. Without this they
+    # would fall through to the Sonnet ``default`` rate.
+    assert pricing_per_mtok("qwen3:30b-a3b-instruct-2507-q4_K_M") == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_is_local_model_discriminates_local_from_cloud():
+    assert is_local_model("qwen3:30b-a3b-instruct-2507-q4_K_M")  # Ollama name:tag
+    assert is_local_model("llama3.1")  # untagged local family
+    assert not is_local_model("claude-sonnet-4-5")
+    assert not is_local_model("gemini-2.0-flash")
+    assert not is_local_model("")
+
+
+def test_compute_call_cost_local_model_is_zero():
+    cost = compute_call_cost_usd(
+        "qwen3:30b-a3b-instruct-2507-q4_K_M",
+        {"input_tokens": 1_607, "output_tokens": 287},
+    )
+    assert cost == 0.0
 
 
 def test_compute_call_cost_sonnet_basic():
