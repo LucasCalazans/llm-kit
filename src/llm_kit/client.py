@@ -510,7 +510,7 @@ class LLMClient:
         system_text = self._to_ollama_system(system)
         if system_text:
             ollama_messages.append({"role": "system", "content": system_text})
-        ollama_messages.extend(messages)
+        ollama_messages.extend(self._to_ollama_messages(messages))
 
         payload: dict[str, Any] = {
             "model": model,
@@ -600,6 +600,27 @@ class LLMClient:
             if text:
                 parts.append(text)
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _to_ollama_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Flatten each message's ``content`` to a plain string for Ollama.
+
+        Ollama's ``/api/chat`` requires ``content`` to be a string, but callers
+        may pass Anthropic-style content blocks (``[{"type": "text", "text":
+        ...}]``, sometimes carrying ``cache_control``). We concatenate the text
+        blocks in order — the same collapse :meth:`_to_ollama_system` does for
+        the system prompt — so the prompt the local model sees matches the
+        Anthropic path verbatim. Non-text blocks (e.g. images) are dropped:
+        text models can't use them, and vision areas never route to Ollama.
+        """
+        flattened: list[dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                parts = [block["text"] for block in content if isinstance(block, dict) and block.get("text")]
+                msg = {**msg, "content": "\n\n".join(parts)}
+            flattened.append(msg)
+        return flattened
 
     @staticmethod
     def _to_anthropic_system(

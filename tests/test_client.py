@@ -140,6 +140,45 @@ def test_to_ollama_system_none_returns_empty_string():
     assert LLMClient._to_ollama_system(None) == ""
 
 
+def test_to_ollama_messages_flattens_block_content_to_string():
+    # Anthropic-style block content (as football's HQ script builds it) must
+    # collapse to a single string — Ollama's /api/chat rejects a content array
+    # with "cannot unmarshal array into ... content of type string".
+    out = LLMClient._to_ollama_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "data"},
+                    {"type": "text", "text": "lang"},
+                ],
+            }
+        ]
+    )
+    assert out == [{"role": "user", "content": "data\n\nlang"}]
+
+
+def test_to_ollama_messages_string_content_untouched():
+    msgs = [{"role": "user", "content": "plain"}]
+    assert LLMClient._to_ollama_messages(msgs) == msgs
+
+
+def test_to_ollama_messages_drops_non_text_blocks():
+    # A text model can't use image blocks; vision areas never route here.
+    out = LLMClient._to_ollama_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "x"}},
+                    {"type": "text", "text": "caption"},
+                ],
+            }
+        ]
+    )
+    assert out[0]["content"] == "caption"
+
+
 # ---------------------------------------------------------------------------
 # Text + usage extraction
 # ---------------------------------------------------------------------------
