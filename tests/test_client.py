@@ -17,6 +17,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from litellm import exceptions as litellm_exceptions
+
 from llm_kit import (
     CallRecord,
     LLMClient,
@@ -26,6 +28,7 @@ from llm_kit import (
     extract_anthropic_tool_citations,
     set_usage_callback,
 )
+from llm_kit.client import _is_transient
 
 
 @pytest.fixture(autouse=True)
@@ -314,3 +317,65 @@ def test_extract_citations_walks_web_search_results_and_dedupes():
     resp = LLMResponse(text="x", model="m", usage=LLMUsage(), raw=raw)
     urls = extract_anthropic_tool_citations(resp)
     assert urls == ["https://a", "https://b", "https://c"]
+
+
+# ---------------------------------------------------------------------------
+# Transient-error classification (retry gate for _anthropic_complete)
+# ---------------------------------------------------------------------------
+
+
+def _make_ise(status_code: int | None) -> litellm_exceptions.InternalServerError:
+    exc = litellm_exceptions.InternalServerError(
+        message="synthetic", llm_provider="anthropic", model="claude-sonnet-4-5"
+    )
+    exc.status_code = status_code  # LiteLLM leaves this None for connect failures.
+    return exc
+
+
+def test_is_transient_true_for_rate_limit():
+    exc = litellm_exceptions.RateLimitError(
+        message="rl", llm_provider="anthropic", model="claude-sonnet-4-5"
+    )
+    assert _is_transient(exc) is True
+
+
+def test_is_transient_true_for_500_and_529():
+    assert _is_transient(_make_ise(500)) is True
+    assert _is_transient(_make_ise(529)) is True
+
+
+def test_is_transient_false_for_4xx_internal_server_error():
+    assert _is_transient(_make_ise(400)) is False
+
+
+def test_is_transient_true_when_cause_chain_is_a_connect_error():
+    """The regression this test guards: api.anthropic.com outage on 2026-07-27.
+
+    LiteLLM wrapped an aiohttp TCP failure into ``InternalServerError`` with
+    ``status_code=None``; the old ``_is_transient`` returned False on the
+    first attempt and the ideation pipeline hard-failed 12 times in ~45min.
+    """
+    inner = ConnectionRefusedError("Cannot connect to host api.anthropic.com:443")
+    outer = _make_ise(None)
+    outer.__cause__ = inner
+    assert _is_transient(outer) is True
+
+
+def test_is_transient_true_for_timeout_in_cause_chain():
+    inner = TimeoutError("read timeout")
+    outer = _make_ise(None)
+    outer.__cause__ = inner
+    assert _is_transient(outer) is True
+
+
+def test_is_transient_false_for_status_none_without_connect_cause():
+    """status_code=None alone is not enough — some other InternalServerError
+    shapes should still fail fast. Only classify as transient when the cause
+    chain actually names a network-layer failure."""
+    outer = _make_ise(None)
+    outer.__cause__ = ValueError("bad json")
+    assert _is_transient(outer) is False
+
+
+def test_is_transient_false_for_unrelated_exception():
+    assert _is_transient(ValueError("nope")) is False

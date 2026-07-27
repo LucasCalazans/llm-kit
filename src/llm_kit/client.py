@@ -109,15 +109,71 @@ def _parse_retry_after(exc: Exception) -> float:
     return _DEFAULT_WAIT_S
 
 
+# Names of aiohttp connector exceptions we care about. Matched by class name
+# instead of a hard aiohttp import because llm-kit doesn't depend on aiohttp
+# directly — LiteLLM's Anthropic path pulls it in and raises these types when
+# the TCP handshake fails or the peer drops mid-response.
+_AIOHTTP_CONNECT_EXC_NAMES = frozenset(
+    {
+        "ClientConnectorError",
+        "ClientConnectorSSLError",
+        "ClientConnectorCertificateError",
+        "ClientOSError",
+        "ClientPayloadError",
+        "ServerDisconnectedError",
+        "ServerConnectionError",
+    }
+)
+
+
+def _is_connect_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or anything in its cause chain) is a network-layer error.
+
+    LiteLLM wraps TCP/SSL/DNS failures from httpx or aiohttp into a bare
+    ``litellm.InternalServerError`` **without** ``status_code`` — the old
+    heuristic (``status_code in {500, 529}``) missed them and every ideation
+    call hard-failed on the first attempt during api.anthropic.com outages.
+    Walking the ``__cause__`` / ``__context__`` chain lets us classify those
+    as transient regardless of the outer wrapper.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(
+            cur,
+            (
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+                ConnectionError,
+                TimeoutError,
+            ),
+        ):
+            return True
+        if type(cur).__name__ in _AIOHTTP_CONNECT_EXC_NAMES:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def _is_transient(exc: Exception) -> bool:
     if isinstance(exc, litellm_exceptions.RateLimitError):
+        return True
+    if isinstance(exc, litellm_exceptions.ServiceUnavailableError):
         return True
     if isinstance(exc, litellm_exceptions.InternalServerError):
         # Anthropic's 529 "overloaded" surfaces as InternalServerError on
         # LiteLLM's side. We treat it transient like the SDK wrapper did.
-        return getattr(exc, "status_code", None) in (500, 529)
-    if isinstance(exc, litellm_exceptions.ServiceUnavailableError):
-        return True
+        if getattr(exc, "status_code", None) in (500, 529):
+            return True
+        # LiteLLM also wraps httpx/aiohttp connect+read failures into a
+        # status-code-less InternalServerError. Look through the cause chain
+        # so a TCP outage triggers backoff instead of hard-failing on the
+        # first attempt (see the 2026-07-27 api.anthropic.com blackout).
+        if _is_connect_error(exc):
+            return True
     return False
 
 
