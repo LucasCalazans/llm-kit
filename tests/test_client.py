@@ -12,11 +12,12 @@ verify that:
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
-
 from litellm import exceptions as litellm_exceptions
 
 from llm_kit import (
@@ -29,6 +30,7 @@ from llm_kit import (
     set_usage_callback,
 )
 from llm_kit.client import _is_transient
+from llm_kit.exceptions import LLMError
 
 
 @pytest.fixture(autouse=True)
@@ -379,3 +381,94 @@ def test_is_transient_false_for_status_none_without_connect_cause():
 
 def test_is_transient_false_for_unrelated_exception():
     assert _is_transient(ValueError("nope")) is False
+
+
+# ---------------------------------------------------------------------------
+# Ollama path — retry policy on transport failures
+#
+# A ReadTimeout means the server accepted the request and is still generating
+# past the read window; re-POSTing the identical payload is worse than useless
+# (Ollama doesn't cancel the abandoned generation, and it never fits inside a
+# scheduled run). So a ReadTimeout is terminal. Cheap pre-generation failures
+# (ConnectError/ConnectTimeout) stay retriable — redoing those is fast.
+# ---------------------------------------------------------------------------
+
+
+def _ollama_client() -> LLMClient:
+    settings = SimpleNamespace(
+        llm_provider="ollama",
+        anthropic_api_key="",
+        ollama_base_url="http://localhost:11434",
+        ollama_model="qwen3",
+        llm_model="",
+    )
+    return LLMClient(settings)
+
+
+async def test_ollama_read_timeout_is_terminal_and_not_retried(monkeypatch):
+    calls = 0
+
+    async def fake_post(self, url, json=None):
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("read operation timed out")
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    c = _ollama_client()
+    with pytest.raises(LLMError) as excinfo:
+        await c._ollama_complete(
+            caller="ranked_script_generator",
+            messages=[{"role": "user", "content": "hi"}],
+            system=None,
+            max_tokens=4800,
+            model="qwen3",
+            max_retries=3,
+            json_schema=None,
+        )
+
+    # Exactly one POST to /api/chat — no second generation kicked off.
+    assert calls == 1
+    # And no backoff sleep, since we didn't loop.
+    assert slept == []
+    assert "not retried" in str(excinfo.value)
+
+
+async def test_ollama_connect_error_is_still_retried(monkeypatch):
+    calls = 0
+
+    async def fake_post(self, url, json=None):
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("connection refused")
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    c = _ollama_client()
+    with pytest.raises(LLMError):
+        await c._ollama_complete(
+            caller="ranked_script_generator",
+            messages=[{"role": "user", "content": "hi"}],
+            system=None,
+            max_tokens=128,
+            model="qwen3",
+            max_retries=2,
+            json_schema=None,
+        )
+
+    # 1 initial attempt + 2 retries — a pre-generation failure is cheap to redo.
+    assert calls == 3
+    # Backoff between the retries: 10s, 20s.
+    assert slept == [10.0, 20.0]

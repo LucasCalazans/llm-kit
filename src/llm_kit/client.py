@@ -58,9 +58,12 @@ _MAX_RETRIES = 3
 # several GB on every call when ``OLLAMA_KEEP_ALIVE=0`` and then does prefill +
 # generation on the CPU — 120s is far too tight and surfaces as ReadTimeout.
 # Generous default (15 min) to cover cold-load + a large-prompt bilingual
-# generation under memory pressure + a payoff retry; override with
-# ``OLLAMA_REQUEST_TIMEOUT_SECONDS``. Only affects the Ollama path; the
-# Anthropic/Gemini paths use LiteLLM's own timeouts.
+# generation under memory pressure; override with
+# ``OLLAMA_REQUEST_TIMEOUT_SECONDS``. This is a single-shot budget: a
+# ReadTimeout here is terminal (see the retry loop in ``_ollama_complete``), so
+# the window has to cover the whole generation on its own — there is no payoff
+# retry to fall back on. Only affects the Ollama path; the Anthropic/Gemini
+# paths use LiteLLM's own timeouts.
 _OLLAMA_READ_TIMEOUT_S = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT_SECONDS", "900"))
 
 
@@ -610,6 +613,24 @@ class LLMClient:
                         max_retries,
                     )
                     await asyncio.sleep(wait)
+                except httpx.ReadTimeout as exc:
+                    # Terminal, on purpose. A ReadTimeout means the server
+                    # accepted the request and is still generating past the read
+                    # timeout — the response wasn't lost, we gave up on work that
+                    # is still running. Retrying re-POSTs the identical payload
+                    # from scratch, which is worse than useless here: Ollama does
+                    # not cancel on client disconnect, so the abandoned
+                    # generation keeps burning the CPU, and with
+                    # ``OLLAMA_NUM_PARALLEL=1`` the retry queues *behind* it and
+                    # cannot even start. Inside a scheduled run (the scheduler
+                    # kills the attempt at ~1200s) a second ~900s generation has
+                    # no time left to finish anyway. Cheap pre-generation
+                    # failures (ConnectError/ConnectTimeout) still fall through to
+                    # the retry branch below — redoing those is fast and useful.
+                    raise LLMError(
+                        f"ollama read timed out after {_OLLAMA_READ_TIMEOUT_S:.0f}s "
+                        f"(not retried; generation likely still running): {exc}"
+                    ) from exc
                 except httpx.HTTPError as exc:
                     last_exc = exc
                     if attempt >= max_retries:
