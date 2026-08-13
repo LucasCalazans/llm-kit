@@ -335,9 +335,7 @@ def _make_ise(status_code: int | None) -> litellm_exceptions.InternalServerError
 
 
 def test_is_transient_true_for_rate_limit():
-    exc = litellm_exceptions.RateLimitError(
-        message="rl", llm_provider="anthropic", model="claude-sonnet-4-5"
-    )
+    exc = litellm_exceptions.RateLimitError(message="rl", llm_provider="anthropic", model="claude-sonnet-4-5")
     assert _is_transient(exc) is True
 
 
@@ -472,3 +470,90 @@ async def test_ollama_connect_error_is_still_retried(monkeypatch):
     assert calls == 3
     # Backoff between the retries: 10s, 20s.
     assert slept == [10.0, 20.0]
+
+
+# ---------------------------------------------------------------------------
+# keep_alive — per-request override of the server's OLLAMA_KEEP_ALIVE.
+#
+# The host that runs the heavy local model keeps OLLAMA_KEEP_ALIVE=0 so a ~20 GB
+# model never squats on a 25 GB box. That is right for the host and wrong for a
+# caller issuing a burst of related calls, which then pays a full model load and
+# throws away the shared prefix on every one. These pin the two halves of the
+# contract: opt in and the field is sent, stay silent and it is absent.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def _capture_post(sink: list[dict]):
+    async def fake_post(self, url, json=None):
+        sink.append(json)
+        return _FakeResponse({"message": {"content": '{"ok": true}'}, "prompt_eval_count": 7, "eval_count": 3})
+
+    return fake_post
+
+
+async def test_ollama_keep_alive_is_sent_when_requested(monkeypatch):
+    sent: list[dict] = []
+    monkeypatch.setattr(httpx.AsyncClient, "post", _capture_post(sent))
+
+    await _ollama_client()._ollama_complete(
+        caller="cortes_selector.map[0]",
+        messages=[{"role": "user", "content": "hi"}],
+        system=None,
+        max_tokens=64,
+        model="qwen3",
+        max_retries=0,
+        json_schema=None,
+        keep_alive="10m",
+    )
+
+    assert sent[0]["keep_alive"] == "10m"
+
+
+async def test_ollama_keep_alive_zero_is_sent_not_treated_as_unset(monkeypatch):
+    # "0" is how a caller hands the memory back; a falsy check would swallow it
+    # and leave the model resident exactly when the render wants the RAM.
+    sent: list[dict] = []
+    monkeypatch.setattr(httpx.AsyncClient, "post", _capture_post(sent))
+
+    await _ollama_client()._ollama_complete(
+        caller="cortes_selector.release",
+        messages=[{"role": "user", "content": "{}"}],
+        system=None,
+        max_tokens=1,
+        model="qwen3",
+        max_retries=0,
+        json_schema=None,
+        keep_alive="0",
+    )
+
+    assert sent[0]["keep_alive"] == "0"
+
+
+async def test_ollama_omits_keep_alive_by_default(monkeypatch):
+    # Absent, not null: the server's own OLLAMA_KEEP_ALIVE must keep deciding
+    # for every call site that has no opinion.
+    sent: list[dict] = []
+    monkeypatch.setattr(httpx.AsyncClient, "post", _capture_post(sent))
+
+    await _ollama_client()._ollama_complete(
+        caller="ranked_script_generator",
+        messages=[{"role": "user", "content": "hi"}],
+        system=None,
+        max_tokens=64,
+        model="qwen3",
+        max_retries=0,
+        json_schema=None,
+    )
+
+    assert "keep_alive" not in sent[0]

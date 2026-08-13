@@ -206,9 +206,7 @@ class LLMClient:
             anthropic_api_key=anthropic_api_key
             if anthropic_api_key is not None
             else getattr(base, "anthropic_api_key", "") or "",
-            gemini_api_key=gemini_api_key
-            if gemini_api_key is not None
-            else getattr(base, "gemini_api_key", "") or "",
+            gemini_api_key=gemini_api_key if gemini_api_key is not None else getattr(base, "gemini_api_key", "") or "",
             ollama_base_url=ollama_base_url
             if ollama_base_url is not None
             else getattr(base, "ollama_base_url", "") or "",
@@ -305,6 +303,7 @@ class LLMClient:
         json_schema: dict[str, Any] | None = None,
         json_mode: bool = False,
         think: bool = False,
+        keep_alive: str | None = None,
     ) -> LLMResponse:
         """Run a chat-style completion against the configured provider.
 
@@ -332,6 +331,11 @@ class LLMClient:
             json_schema: JSON schema enforced server-side (Ollama only) for
                 structured output. Anthropic ignores this — call sites that
                 need JSON over Anthropic continue to coerce via prompt + parse.
+            keep_alive: **Ollama only.** How long the server should hold the
+                model resident after this request (``"10m"``, ``"0"``, …).
+                ``None`` leaves the server's ``OLLAMA_KEEP_ALIVE`` in charge.
+                Ignored on every other provider, so a call site that issues the
+                same request either way can pass it unconditionally.
 
         Returns:
             :class:`LLMResponse` with concatenated text, usage breakdown
@@ -358,6 +362,7 @@ class LLMClient:
                 # schema, fall back to format="json" (handled inside the method).
                 json_schema=json_schema,
                 json_mode=json_mode,
+                keep_alive=keep_alive,
                 think=think,
             )
 
@@ -547,6 +552,7 @@ class LLMClient:
         json_schema: dict[str, Any] | None,
         json_mode: bool = False,
         think: bool = False,
+        keep_alive: str | None = None,
     ) -> LLMResponse:
         """Talk to a local Ollama server via the native ``/api/chat`` endpoint.
 
@@ -560,6 +566,15 @@ class LLMClient:
         ``cache="ephemeral"`` flag is ignored (Ollama has no equivalent), but
         text order is preserved so prompt content stays identical to the
         Anthropic path.
+
+        ``keep_alive`` (``"10m"``, ``"0"``, …) overrides the server's
+        ``OLLAMA_KEEP_ALIVE`` for this request only. A host that keeps the
+        default of 0 unloads the model the moment each response lands, so a
+        caller issuing a burst of related calls pays the full load *and* throws
+        away the KV cache every single time — on a big model served largely off
+        CPU that dominates the wall clock. Passing a duration lets such a caller
+        hold the model for its burst and hand back the RAM at the end, without
+        the host having to hold it for everyone.
         """
         base_url = (self._settings.ollama_base_url or "").rstrip("/")
         if not base_url:
@@ -583,6 +598,10 @@ class LLMClient:
             "options": {"num_predict": max_tokens},
         }
         payload["format"] = json_schema if json_schema is not None else "json"
+        # Omitted entirely when None so the server's own OLLAMA_KEEP_ALIVE
+        # keeps deciding — this must stay opt-in per call site.
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
 
         url = f"{base_url}/api/chat"
         last_exc: Exception | None = None
