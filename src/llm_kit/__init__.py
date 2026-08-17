@@ -21,7 +21,12 @@ from llm_kit.exceptions import (
     LLMOverloadedError,
     LLMRateLimitError,
 )
-from llm_kit.pricing import compute_call_cost_usd, pricing_per_mtok, summarize_costs
+from llm_kit.pricing import (
+    compute_call_cost_usd,
+    pricing_per_mtok,
+    search_usd_per_call,
+    summarize_costs,
+)
 from llm_kit.prompts import PromptMeta, PromptRegistry, PromptSpec
 from llm_kit.telemetry import (
     CallRecord,
@@ -56,6 +61,7 @@ __all__ = [
     # Pricing
     "compute_call_cost_usd",
     "pricing_per_mtok",
+    "search_usd_per_call",
     "summarize_costs",
     # Prompts
     "PromptRegistry",

@@ -180,6 +180,40 @@ def _is_transient(exc: Exception) -> bool:
     return False
 
 
+# Tool keys Google treats as "search-grounded". A request carrying any of them
+# cannot also force a response MIME type, which is what makes this list load
+# bearing rather than cosmetic. Mirrors LiteLLM's own set so a tool that LiteLLM
+# routes to grounding is one we know to drop json_mode for.
+_GEMINI_SEARCH_TOOL_KEYS = frozenset(
+    {
+        "googleSearch",
+        "google_search",
+        "googleSearchRetrieval",
+        "google_search_retrieval",
+        "enterpriseWebSearch",
+        "enterprise_web_search",
+        "urlContext",
+    }
+)
+
+
+def _has_gemini_search_tool(tools: list[dict[str, Any]] | None) -> bool:
+    """True when ``tools`` carries a Google search-grounding entry.
+
+    Also matches the OpenAI-style ``{"type": "web_search"}`` shape, which
+    LiteLLM rewrites into ``googleSearch`` before the request leaves — the
+    JSON restriction applies just the same.
+    """
+    for tool in tools or ():
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") in ("web_search", "web_search_preview"):
+            return True
+        if _GEMINI_SEARCH_TOOL_KEYS & tool.keys():
+            return True
+    return False
+
+
 class LLMClient:
     """Provider-agnostic completion client backed by LiteLLM.
 
@@ -235,24 +269,29 @@ class LLMClient:
         )
 
     def _ensure_configured(self) -> None:
-        """One-time provider-specific setup. LiteLLM picks up provider keys
-        from the environment, but we forward the configured value so a key
-        loaded from .env via the consumer's settings works without exporting
-        it explicitly."""
+        """One-time provider setup. LiteLLM picks up provider keys from the
+        environment, but we forward the configured value so a key loaded from
+        .env via the consumer's settings works without exporting it explicitly.
+
+        **Every** provider with a key present is wired, not just
+        ``llm_provider``. A call site may pass ``provider=`` explicitly to route
+        one area somewhere else (``web_anchor`` on Gemini while the global
+        provider stays Anthropic), and keying setup off the global provider
+        meant that call reached LiteLLM with no credential — an auth failure at
+        the first request, on a path whose whole job is to be reliable.
+        """
         if self._configured:
             return
-        if self._settings.llm_provider == "anthropic":
-            key = self._settings.anthropic_api_key or ""
-            if key:
-                litellm.anthropic_key = key
-        elif self._settings.llm_provider == "gemini":
-            key = self._settings.gemini_api_key or ""
-            if key:
-                # LiteLLM reads `gemini_api_key` for the `gemini/…` route, but
-                # also accepts the canonical env var. Set both — env wins
-                # over module attr in some LiteLLM versions.
-                litellm.gemini_key = key
-                os.environ.setdefault("GEMINI_API_KEY", key)
+        anthropic_key = self._settings.anthropic_api_key or ""
+        if anthropic_key:
+            litellm.anthropic_key = anthropic_key
+        gemini_key = self._settings.gemini_api_key or ""
+        if gemini_key:
+            # LiteLLM reads `gemini_api_key` for the `gemini/…` route, but
+            # also accepts the canonical env var. Set both — env wins
+            # over module attr in some LiteLLM versions.
+            litellm.gemini_key = gemini_key
+            os.environ.setdefault("GEMINI_API_KEY", gemini_key)
         self._configured = True
 
     def _record_usage(self, *, caller: str, model: str, usage: LLMUsage) -> None:
@@ -374,6 +413,7 @@ class LLMClient:
                 max_tokens=max_tokens,
                 model=resolved_model,
                 max_retries=max_retries,
+                tools=tools,
                 json_mode=json_mode,
             )
 
@@ -398,6 +438,7 @@ class LLMClient:
         max_tokens: int,
         model: str,
         max_retries: int,
+        tools: list[dict[str, Any]] | None = None,
         json_mode: bool = False,
     ) -> LLMResponse:
         """Gemini route via LiteLLM's ``gemini/<model>`` provider.
@@ -418,6 +459,17 @@ class LLMClient:
           LiteLLM). This is the supported way to force JSON output.
         - Cache flags from the friendly system shape are dropped —
           Gemini's context caching has a different API.
+        - ``tools`` are forwarded **verbatim** — Gemini's tool shapes are
+          not Anthropic's. Google Search grounding is
+          ``[{"googleSearch": {}}]``; passing an Anthropic
+          ``{"type": "web_search_20250305", ...}`` block here does NOT
+          degrade to grounding, it is silently dropped by LiteLLM's
+          transform (it strips ``type`` and then finds two remaining keys,
+          so no tool name resolves). Call sites branch per provider.
+        - **Grounding and forced JSON are mutually exclusive.** Google
+          rejects ``responseMimeType`` on a request carrying a search tool,
+          so ``json_mode`` is dropped when one is present and the caller
+          gets prose that may fence its JSON. Parse defensively.
         """
         self._ensure_configured()
 
@@ -440,8 +492,16 @@ class LLMClient:
             "max_tokens": max_tokens,
             "messages": gemini_messages,
         }
+        if tools:
+            kwargs["tools"] = tools
         if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
+            if _has_gemini_search_tool(tools):
+                logger.info(
+                    "%s: dropping json_mode — Gemini rejects responseMimeType alongside a search tool",
+                    caller,
+                )
+            else:
+                kwargs["response_format"] = {"type": "json_object"}
 
         for attempt in range(max_retries + 1):
             try:

@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from llm_kit.pricing import compute_call_cost_usd, is_local_model, pricing_per_mtok, summarize_costs
+import pytest
+
+from llm_kit.pricing import (
+    compute_call_cost_usd,
+    is_local_model,
+    pricing_per_mtok,
+    search_usd_per_call,
+    summarize_costs,
+)
 
 
 def test_pricing_per_mtok_resolves_known_family():
@@ -115,3 +123,62 @@ def test_summarize_costs_empty_returns_zero_totals():
     assert summary["total_usd"] == 0.0
     assert summary["model"] == ""
     assert summary["by_model"] == {}
+
+
+# --- longest-prefix resolution -----------------------------------------------
+#
+# The regression these guard: before 2026-08 the table matched in dict-insertion
+# order, so a model id could resolve to a SHORTER family row that happened to be
+# declared first, and any id newer than the table (``claude-opus-4-6``) fell all
+# the way through to the Sonnet ``default`` — pricing Opus calls ~40% under.
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_input_rate"),
+    [
+        ("claude-opus-4-5", 15.00),  # specific row wins over "claude-opus-4-…"
+        ("claude-opus-4-6", 5.00),  # current Opus line, was hitting default
+        ("claude-opus-5", 5.00),
+        ("claude-sonnet-4-6", 3.00),
+        ("claude-sonnet-5", 3.00),
+        ("claude-fable-5", 10.00),
+        ("gemini-3.7-flash", 0.75),
+        ("gpt-5.6-luna", 0.20),
+        ("gpt-5.6-sol", 5.00),
+        ("gpt-5", 1.25),  # shorter row still reachable when nothing longer matches
+    ],
+)
+def test_pricing_per_mtok_prefers_longest_matching_prefix(model, expected_input_rate):
+    assert pricing_per_mtok(model)[0] == expected_input_rate
+
+
+def test_pricing_per_mtok_opus_no_longer_falls_through_to_default():
+    assert pricing_per_mtok("claude-opus-4-8") != pricing_per_mtok("default")
+
+
+# --- provider-aware search pricing -------------------------------------------
+
+
+def test_search_rate_differs_by_provider():
+    assert search_usd_per_call("claude-sonnet-4-6") == 0.010
+    assert search_usd_per_call("gemini-3.7-flash") == 0.014
+
+
+def test_search_rate_is_zero_for_local_models():
+    assert search_usd_per_call("qwen3:30b-a3b-instruct-2507-q4_K_M") == 0.0
+    assert search_usd_per_call("") == 0.0
+
+
+def test_search_rate_unknown_model_falls_back_to_anthropic():
+    assert search_usd_per_call("gpt-7-omega") == 0.010
+
+
+def test_grounded_gemini_call_prices_search_at_gemini_rate():
+    # The web_anchor shape after the 2026-08 migration: a small prompt, a small
+    # answer, and the retrieved context NOT billed as input.
+    cost = compute_call_cost_usd(
+        "gemini-3.7-flash",
+        {"input_tokens": 500, "output_tokens": 200, "web_searches": 1},
+    )
+    expected = round(500 / 1_000_000 * 0.75 + 200 / 1_000_000 * 3.75 + 0.014, 6)
+    assert cost == expected
