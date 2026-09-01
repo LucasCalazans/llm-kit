@@ -842,10 +842,32 @@ class LLMClient:
         cache_write = getattr(usage_obj, "cache_creation_input_tokens", 0) or 0
         prompt_tokens = getattr(usage_obj, "prompt_tokens", 0) or 0
 
+        # ⚠️ ``text_tokens`` é só a fatia TEXTUAL. Preferi-lo sozinho estava
+        # certo para a Anthropic (onde as outras fatias são cache, cobradas à
+        # parte) e ERRADO para o Gemini, que reporta a imagem em
+        # ``image_tokens`` e deixa ``text_tokens`` com o prompt cru.
+        #
+        # Medido em 01/09/2026 com 4 frames 640x360 no gemini-3.1-flash-lite:
+        # prompt_tokens=4407, text_tokens=7, image_tokens=4400. A extração
+        # antiga registrava 7 — 0,2% do custo real. Como visão é ~1.100 chamadas
+        # em 45 dias no Prism, a telemetria (e a estimativa de custo do catálogo
+        # que se apoia nela) ficaria silenciosamente perto de zero.
+        #
+        # Somar as fatias não-cache mantém o comportamento correto da Anthropic
+        # (cache continua fora, contabilizado nas suas próprias colunas) e passa
+        # a contar imagem/vídeo/áudio onde o provider as separa.
         details = getattr(usage_obj, "prompt_tokens_details", None)
-        text_tokens = getattr(details, "text_tokens", None) if details is not None else None
-        if isinstance(text_tokens, int):
-            input_tokens = text_tokens
+        billable = None
+        if details is not None:
+            parts = [
+                getattr(details, name, None)
+                for name in ("text_tokens", "image_tokens", "video_tokens", "audio_tokens")
+            ]
+            present = [p for p in parts if isinstance(p, int)]
+            if present:
+                billable = sum(present)
+        if billable is not None:
+            input_tokens = billable
         else:
             input_tokens = max(0, prompt_tokens - cache_read - cache_write)
 

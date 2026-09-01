@@ -50,10 +50,21 @@ _PRICING_USD_PER_MTOK: dict[str, tuple[float, float, float, float]] = {
     "claude-sonnet-4": (3.00, 15.00, 0.30, 3.75),
     "claude-haiku-4-5": (1.00, 5.00, 0.10, 1.25),
     # ---- Google Gemini ------------------------------------------------
+    # Verified against ai.google.dev/gemini-api/docs/pricing on 2026-09-01.
+    #
+    # 3.1 Flash-Lite is the model Prism runs on since the 2026-09-01 migration.
+    # Text/image/video share the 0.25 rate; AUDIO is 0.50 in and this table has
+    # no way to express a per-modality split, so an audio route would be
+    # UNDERPRICED by 2x here. Nothing sends audio today.
+    "gemini-3.1-flash-lite": (0.25, 1.50, 0.025, 0.25),
     # 3.7 Flash is on introductory pricing through 2026-12-31; it doubles to
     # (1.50, 7.50) on 2027-01-01. See PRICING_REVIEW_DATES.
     "gemini-3.7-flash": (0.75, 3.75, 0.075, 0.75),
+    "gemini-3.6-flash": (0.75, 3.75, 0.075, 0.75),
     "gemini-3.5-flash": (1.50, 9.00, 0.15, 1.50),
+    # 3.1 Pro is tiered by prompt size: (2.00, 12.00) at <=200k tokens and
+    # (4.00, 18.00) above it. This table is stateless, so the row carries the
+    # cheap tier and a >200k prompt logs low. Prism's largest prompt is ~15k.
     "gemini-3.1-pro": (2.00, 12.00, 0.20, 2.00),
     # No ``gemini-2.5-flash-lite`` row on purpose: probed 2026-08-17 and the API
     # answers 404 "no longer available". A priced row for a retired id is worse
