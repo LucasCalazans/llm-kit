@@ -7,7 +7,7 @@ verify that:
   - the system-block translators behave for both providers
   - usage extraction handles cached vs uncached tokens correctly
   - _record_usage builds a CallRecord and fires the global callback registry
-  - extract_anthropic_tool_citations walks LiteLLM's flattened shape
+  - extract_search_citations walks LiteLLM's flattened shape
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from llm_kit import (
     LLMResponse,
     LLMUsage,
     clear_usage_callbacks,
-    extract_anthropic_tool_citations,
+    extract_search_citations,
     set_usage_callback,
 )
 from llm_kit.client import _is_transient
@@ -299,7 +299,7 @@ def test_record_usage_fires_callback_with_pricing():
 
 def test_extract_citations_returns_empty_when_raw_is_none():
     resp = LLMResponse(text="x", model="m", usage=LLMUsage(), raw=None)
-    assert extract_anthropic_tool_citations(resp) == []
+    assert extract_search_citations(resp) == []
 
 
 def test_extract_citations_walks_web_search_results_and_dedupes():
@@ -317,7 +317,7 @@ def test_extract_citations_walks_web_search_results_and_dedupes():
     }
     raw.choices = [MagicMock(message=message)]
     resp = LLMResponse(text="x", model="m", usage=LLMUsage(), raw=raw)
-    urls = extract_anthropic_tool_citations(resp)
+    urls = extract_search_citations(resp)
     assert urls == ["https://a", "https://b", "https://c"]
 
 
@@ -557,3 +557,45 @@ async def test_ollama_omits_keep_alive_by_default(monkeypatch):
     )
 
     assert "keep_alive" not in sent[0]
+
+
+def test_extract_search_citations_reads_gemini_annotations():
+    """O caminho Gemini vive em ``message.annotations``, não em ``provider_specific_fields``.
+
+    Medido em 02/09/2026 contra a API real: o LiteLLM normaliza o
+    ``groundingMetadata`` do Google para o formato OpenAI de ``url_citation``,
+    e o leitor antigo — que só olhava ``provider_specific_fields`` — devolvia
+    lista vazia. O enricher perdia as fontes do retrieval sem erro nenhum.
+    """
+    resp = LLMResponse(
+        text="…",
+        model="gemini-3.1-flash-lite",
+        usage=LLMUsage(),
+        raw=SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        provider_specific_fields={"thought_signatures": ["x"]},
+                        annotations=[
+                            {"type": "url_citation", "url_citation": {"title": "sony.com", "url": "https://redirect/a"}},
+                            {"type": "url_citation", "url_citation": {"title": "outra", "url": "https://redirect/b"}},
+                            # Duplicata: a deduplicação preserva a ordem de inserção.
+                            {"type": "url_citation", "url_citation": {"title": "sony.com", "url": "https://redirect/a"}},
+                        ],
+                    )
+                )
+            ]
+        ),
+    )
+    assert extract_search_citations(resp) == ["https://redirect/a", "https://redirect/b"]
+
+
+def test_extract_search_citations_survives_a_response_without_annotations():
+    """Anthropic não tem ``annotations``; o getattr defensivo não pode explodir."""
+    resp = LLMResponse(
+        text="…",
+        model="claude-haiku-4-5",
+        usage=LLMUsage(),
+        raw=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(provider_specific_fields={}))]),
+    )
+    assert extract_search_citations(resp) == []

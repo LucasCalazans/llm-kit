@@ -364,7 +364,7 @@ class LLMClient:
                 ``[{"type": "web_search_20250305", "name": "web_search",
                 "max_uses": 2}]``. Forwarded verbatim to LiteLLM. Tool results
                 surface under ``response.raw.choices[0].message.provider_specific_fields``;
-                use :func:`extract_anthropic_tool_citations` to read them.
+                use :func:`extract_search_citations` to read them.
             provider: Per-call provider override (``"anthropic"`` | ``"ollama"``).
                 When unset, falls back to the configured ``llm_provider``.
             json_schema: JSON schema enforced server-side (Ollama only) for
@@ -889,8 +889,27 @@ class LLMClient:
         )
 
 
-def extract_anthropic_tool_citations(response: LLMResponse) -> list[str]:
-    """Pull every URL that LiteLLM surfaced from Anthropic's web_search tool.
+def extract_search_citations(response: LLMResponse) -> list[str]:
+    """Pull every source URL the provider's web-search tool surfaced.
+
+    Provider-agnostic on purpose: the two shapes have nothing in common, and
+    a call site that knows which one it is looking at is a call site that
+    breaks on the next migration. Measured on 2026-09-02, the Gemini path
+    returned an empty list from the Anthropic-only reader — the enricher lost
+    its retrieval sources with nothing in the log.
+
+    Two buckets are read:
+
+    - **Anthropic**: ``web_search_results`` and ``citations`` under
+      ``message.provider_specific_fields`` (see below).
+    - **Gemini / OpenAI shape**: ``message.annotations`` entries of
+      ``type == "url_citation"``. LiteLLM normalises Google's
+      ``groundingMetadata`` into this. Note the URLs come back as
+      ``vertexaisearch.cloud.google.com/grounding-api-redirect/…`` redirects
+      rather than the origin — that is what Google hands over; the readable
+      domain is in the entry's ``title``.
+
+    Anthropic detail kept from the original implementation:
 
     LiteLLM flattens the Anthropic response: the visible text is in
     ``response.text`` while the structured ``web_search_tool_result`` and
@@ -922,6 +941,14 @@ def extract_anthropic_tool_citations(response: LLMResponse) -> list[str]:
                 if url and url not in seen:
                     seen.add(url)
                     urls.append(url)
+        for annotation in getattr(message, "annotations", None) or []:
+            entry = annotation.get("url_citation") if isinstance(annotation, dict) else getattr(annotation, "url_citation", None)
+            if entry is None:
+                continue
+            url = entry.get("url") if isinstance(entry, dict) else getattr(entry, "url", None)
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
         for citation_group in psf.get("citations") or []:
             iterable = citation_group if isinstance(citation_group, list) else [citation_group]
             for entry in iterable:

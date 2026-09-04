@@ -12,7 +12,7 @@ from llm_kit.client import (
     LLMClient,
     LLMResponse,
     LLMUsage,
-    extract_anthropic_tool_citations,
+    extract_search_citations,
 )
 from llm_kit.config import SUPPORTED_PROVIDERS, resolve_model, validate_llm_config
 from llm_kit.exceptions import (
@@ -48,7 +48,7 @@ __all__ = [
     "LLMClient",
     "LLMResponse",
     "LLMUsage",
-    "extract_anthropic_tool_citations",
+    "extract_search_citations",
     # Config
     "SUPPORTED_PROVIDERS",
     "resolve_model",
