@@ -269,30 +269,34 @@ class LLMClient:
         )
 
     def _ensure_configured(self) -> None:
-        """One-time provider setup. LiteLLM picks up provider keys from the
-        environment, but we forward the configured value so a key loaded from
-        .env via the consumer's settings works without exporting it explicitly.
+        """One-time provider setup hook.
 
-        **Every** provider with a key present is wired, not just
-        ``llm_provider``. A call site may pass ``provider=`` explicitly to route
-        one area somewhere else (``web_anchor`` on Gemini while the global
-        provider stays Anthropic), and keying setup off the global provider
-        meant that call reached LiteLLM with no credential — an auth failure at
-        the first request, on a path whose whole job is to be reliable.
+        Provider keys are **not** written to process-wide state (``os.environ``
+        or ``litellm.<provider>_key``): they travel per request as ``api_key=``
+        (see :meth:`_api_key_kwargs`). Process-wide state let the first client
+        built in a process decide the key for every other client, which breaks
+        a consumer that holds one client per tenant. An env var the operator
+        exports outside the package still works as LiteLLM's own fallback for
+        a client built without a key.
         """
         if self._configured:
             return
-        anthropic_key = self._settings.anthropic_api_key or ""
-        if anthropic_key:
-            litellm.anthropic_key = anthropic_key
-        gemini_key = self._settings.gemini_api_key or ""
-        if gemini_key:
-            # LiteLLM reads `gemini_api_key` for the `gemini/…` route, but
-            # also accepts the canonical env var. Set both — env wins
-            # over module attr in some LiteLLM versions.
-            litellm.gemini_key = gemini_key
-            os.environ.setdefault("GEMINI_API_KEY", gemini_key)
         self._configured = True
+
+    def _api_key_kwargs(self, provider: str) -> dict[str, Any]:
+        """``{"api_key": <this client's key>}`` for ``provider``, or ``{}``.
+
+        Every provider with a key is honoured, not just ``llm_provider``: a
+        call site may pass ``provider=`` to route one area elsewhere
+        (``web_anchor`` on Gemini while the global provider stays Anthropic).
+        """
+        if provider == "gemini":
+            key = self._settings.gemini_api_key or ""
+        elif provider == "anthropic":
+            key = self._settings.anthropic_api_key or ""
+        else:
+            key = ""
+        return {"api_key": key} if key else {}
 
     def _record_usage(self, *, caller: str, model: str, usage: LLMUsage) -> None:
         """Price + dispatch one successful LLM call to the telemetry layer.
@@ -491,6 +495,7 @@ class LLMClient:
             "model": f"gemini/{model}",
             "max_tokens": max_tokens,
             "messages": gemini_messages,
+            **self._api_key_kwargs("gemini"),
         }
         if tools:
             kwargs["tools"] = tools
@@ -557,6 +562,7 @@ class LLMClient:
             "model": f"anthropic/{model}",
             "max_tokens": max_tokens,
             "messages": effective_messages,
+            **self._api_key_kwargs("anthropic"),
         }
         if anthropic_system is not None:
             kwargs["system"] = anthropic_system
