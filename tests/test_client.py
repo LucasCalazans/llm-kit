@@ -599,3 +599,86 @@ def test_extract_search_citations_survives_a_response_without_annotations():
         raw=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(provider_specific_fields={}))]),
     )
     assert extract_search_citations(resp) == []
+
+
+# ---------------------------------------------------------------------------
+# Per-client API key: each request carries its own client's key
+# ---------------------------------------------------------------------------
+
+
+def _fake_response():
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+        usage=None,
+    )
+
+
+@pytest.fixture
+def captured_acompletion(monkeypatch):
+    import litellm
+
+    sent: list[dict] = []
+
+    async def fake_acompletion(**kwargs):
+        sent.append(kwargs)
+        return _fake_response()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(litellm, "anthropic_key", None, raising=False)
+    monkeypatch.setattr(litellm, "gemini_key", None, raising=False)
+    return sent
+
+
+def _cloud_client(provider: str, key: str) -> LLMClient:
+    if provider == "gemini":
+        return LLMClient(llm_provider="gemini", gemini_api_key=key, llm_model="gemini-x")
+    return LLMClient(llm_provider="anthropic", anthropic_api_key=key, llm_model="claude-x")
+
+
+def _own_key(client: LLMClient) -> str:
+    s = client._settings
+    return s.gemini_api_key if s.llm_provider == "gemini" else s.anthropic_api_key
+
+
+@pytest.mark.parametrize("provider", ["gemini", "anthropic"])
+@pytest.mark.parametrize("order", ["a_first", "b_first"])
+async def test_each_client_sends_its_own_api_key(captured_acompletion, provider, order):
+    a = _cloud_client(provider, "key-aaaa")
+    b = _cloud_client(provider, "key-bbbb")
+    first, second = (a, b) if order == "a_first" else (b, a)
+    for client in (first, second, first):
+        await client.complete(caller="t", messages=[{"role": "user", "content": "hi"}])
+    keys = [call["api_key"] for call in captured_acompletion]
+    assert keys == [_own_key(first), _own_key(second), _own_key(first)]
+
+
+async def test_provider_override_uses_that_providers_key(captured_acompletion):
+    c = LLMClient(
+        llm_provider="anthropic",
+        anthropic_api_key="ant-key",
+        gemini_api_key="gem-key",
+        llm_model="claude-x",
+    )
+    msgs = [{"role": "user", "content": "hi"}]
+    await c.complete(caller="t", messages=msgs, provider="gemini", model="gemini-x")
+    await c.complete(caller="t", messages=msgs)
+    assert [call["api_key"] for call in captured_acompletion] == ["gem-key", "ant-key"]
+
+
+@pytest.mark.parametrize("provider", ["gemini", "anthropic"])
+async def test_keyless_client_does_not_inherit_another_clients_key(captured_acompletion, provider):
+    import os
+
+    import litellm
+
+    keyed = _cloud_client(provider, "key-aaaa")
+    keyless = _cloud_client(provider, "")
+    await keyed.complete(caller="t", messages=[{"role": "user", "content": "hi"}])
+    await keyless.complete(caller="t", messages=[{"role": "user", "content": "hi"}])
+    assert captured_acompletion[0]["api_key"] == "key-aaaa"
+    assert "api_key" not in captured_acompletion[1]
+    assert "GEMINI_API_KEY" not in os.environ
+    assert litellm.anthropic_key is None
+    assert getattr(litellm, "gemini_key", None) is None
